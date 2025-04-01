@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: Arial, sans-serif; }
+        canvas { display: block; }
+        #info {
+            position: absolute;
+            top: 10px;
+            width: 100%;
+            text-align: center;
+            color: rgba(255, 255, 255, 0.7);
+            font-size: 14px;
+            pointer-events: none;
+        }
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            left: 50%;
+            transform: translateX(-50%);
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            z-index: 10;
+        }
+        #textInput {
+            padding: 8px 12px;
+            border: 1px solid #555;
+            background-color: rgba(255, 255, 255, 0.1);
+            color: white;
+            border-radius: 4px;
+            font-size: 16px;
+        }
+        #updateButton {
+            padding: 8px 15px;
+            border: none;
+            background-color: #4a4a4a;
+            color: white;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 16px;
+            transition: background-color 0.3s ease;
+        }
+        #updateButton:hover {
+            background-color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div id="info">Enter text and press 'Apply'</div>
+    <div id="controls">
+        <input type="text" id="textInput" placeholder="Enter text..." value="hello world">
+        <button id="updateButton">Apply</button>
+    </div>
+
+    <script async src="https://unpkg.com/es-module-shims@1.6.3/dist/es-module-shims.js"></script>
+    <script type="importmap">
+    {
+        "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.151.3/build/three.module.js"
+        }
+    }
+    </script>
+    <script type="module">
+        import * as THREE from 'three';
+
+        let scene, camera, renderer;
+        let particles;
+        let positions, colors, sizes, originalPositions, alphas;
+        let material; // Make material accessible globally to update uniforms
+        const particleCount = 50000;
+        const mouse = new THREE.Vector2(-100, -100);
+        const interactionRadius = 80;
+        const clock = new THREE.Clock();
+
+        let isFormingText = true;
+        let transitionProgress = 1.0;
+        const transitionDuration = 2.0;
+        let textTargetPoints = [];
+
+        const textCanvas = document.createElement('canvas');
+        const textCtx = textCanvas.getContext('2d', { willReadFrequently: true });
+        const canvasWidth = 1024;
+        const canvasHeight = 256;
+        textCanvas.width = canvasWidth;
+        textCanvas.height = canvasHeight;
+
+        // --- Shaders Modified for Effects ---
+        const vertexShader = `
+          attribute float size;
+          attribute vec3 customColor;
+          attribute float particleAlpha;
+          uniform float u_time; // Time uniform for pulsing effect
+
+          varying vec3 vColor;
+          varying float vAlpha;
+
+          void main() {
+            vColor = customColor;
+            vAlpha = particleAlpha;
+            vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+
+            // Pulsing size based on time and particle's original position (use position as proxy)
+            float timeFactor = u_time * 1.5;
+            // Use position components for variation to avoid uniform pulsing
+            float pulse = sin(timeFactor + position.x * 0.05 + position.y * 0.03) * 0.25 + 0.85; // Dynamic pulse (0.6 to 1.1)
+
+            gl_PointSize = size * 1.5 * pulse; // Apply pulsing to base size
+            gl_Position = projectionMatrix * mvPosition;
+          }
+        `;
+        const fragmentShader = `
+          varying vec3 vColor;
+          varying float vAlpha;
+          uniform float u_time; // Time uniform for shimmering effect
+
+          void main() {
+            // Glow effect: Brighter center, soft edges using power curve
+            float edgeDist = length(gl_PointCoord - vec2(0.5)); // 0.0 center, 0.5 edge
+            // Power curve for glow: higher power = sharper falloff
+            float glow = pow(max(0.0, 1.0 - edgeDist * 1.8), 3.0); // Ensure base is non-negative
+
+            // Shimmering color based on time, base color, and fragment coordinate
+            float shimmer = sin(u_time * 2.5 + vColor.r * 10.0 + gl_PointCoord.x * 6.0) * 0.15; // Slightly faster shimmer
+            // Apply shimmer additively to the base color
+            vec3 shimmeringColor = vColor + vec3(shimmer, shimmer * 0.8, shimmer * 1.2);
+
+            // Final alpha combines the glow shape and the overall particle alpha
+            float finalAlpha = clamp(glow, 0.0, 1.0) * vAlpha;
+
+            // Discard fragment if it's almost fully transparent
+            if (finalAlpha < 0.01) discard;
+
+            // Final color combines shimmering color and glow intensity boost
+            // Make center significantly brighter
+            gl_FragColor = vec4(shimmeringColor * (0.7 + glow * 0.6), finalAlpha); // Adjust base brightness and glow boost
+          }
+        `;
+
+        // --- Init Function ---
+        function init() {
+            scene = new THREE.Scene();
+            camera = new THREE.PerspectiveCamera(75, window.innerWidth / window.innerHeight, 1, 5000);
+            camera.position.z = 1000;
+
+            renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setClearColor(0x000000, 1);
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(window.devicePixelRatio);
+            document.body.appendChild(renderer.domElement);
+
+            updateTextTargets("hello world");
+
+            const geometry = new THREE.BufferGeometry();
+            positions = new Float32Array(particleCount * 3);
+            colors = new Float32Array(particleCount * 3);
+            sizes = new Float32Array(particleCount);
+            originalPositions = new Float32Array(particleCount * 3);
+            alphas = new Float32Array(particleCount);
+
+            const color = new THREE.Color();
+            const initialSpread = 1500;
+
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3;
+                const ox = THREE.MathUtils.randFloatSpread(initialSpread);
+                const oy = THREE.MathUtils.randFloatSpread(initialSpread);
+                const oz = THREE.MathUtils.randFloatSpread(initialSpread);
+                originalPositions[i3] = ox; originalPositions[i3 + 1] = oy; originalPositions[i3 + 2] = oz;
+
+                if (i < textTargetPoints.length) {
+                    const targetIndex = i % textTargetPoints.length;
+                    positions[i3] = textTargetPoints[targetIndex].x;
+                    positions[i3 + 1] = textTargetPoints[targetIndex].y;
+                    positions[i3 + 2] = textTargetPoints[targetIndex].z;
+                    alphas[i] = 1.0;
+                } else {
+                    positions[i3] = ox; positions[i3 + 1] = oy; positions[i3 + 2] = oz;
+                    alphas[i] = 0.0;
+                }
+
+                color.setHSL(THREE.MathUtils.randFloat(0.55, 0.7), THREE.MathUtils.randFloat(0.7, 0.9), THREE.MathUtils.randFloat(0.5, 0.8));
+                colors[i3] = color.r; colors[i3 + 1] = color.g; colors[i3 + 2] = color.b;
+                sizes[i] = THREE.MathUtils.randFloat(5, 15);
+            }
+
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setAttribute('customColor', new THREE.BufferAttribute(colors, 3));
+            geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
+            geometry.setAttribute('particleAlpha', new THREE.BufferAttribute(alphas, 1));
+
+            // --- Material with Time Uniform ---
+            material = new THREE.ShaderMaterial({
+                uniforms: {
+                    u_time: { value: 0.0 } // Add time uniform
+                },
+                vertexShader: vertexShader,
+                fragmentShader: fragmentShader,
+                blending: THREE.AdditiveBlending,
+                depthTest: false,
+                transparent: true
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+
+            // Event Listeners
+            window.addEventListener('resize', onWindowResize, false);
+            document.addEventListener('mousemove', onMouseMove, false);
+            document.getElementById('updateButton').addEventListener('click', onUpdateButtonClick);
+            // Store initial value for button click logic
+             document.getElementById('textInput')._previousValue = "hello world";
+        }
+
+        // --- Window Resize (No changes) ---
+        function onWindowResize() {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        }
+
+        // --- Mouse Move (No changes) ---
+        function onMouseMove(event) {
+            mouse.x = (event.clientX / window.innerWidth) * 2 - 1;
+            mouse.y = -(event.clientY / window.innerHeight) * 2 + 1;
+        }
+
+        // --- Button Click Handler (Refined state check) ---
+        function onUpdateButtonClick() {
+            const textInput = document.getElementById('textInput');
+            const text = textInput.value;
+            const previousText = textInput._previousValue || ""; // Get previous value
+            const currentFormingState = isFormingText;
+
+            if (text.trim() === "") {
+                // Switching to random state
+                if (currentFormingState) { // Only reset if was forming text
+                    transitionProgress = 0;
+                }
+                isFormingText = false;
+            } else {
+                // Switching to or updating text state
+                // Update only if text changed OR if switching from random state
+                if (text !== previousText || !currentFormingState) {
+                     updateTextTargets(text);
+                     if (textTargetPoints.length > 0) {
+                         transitionProgress = 0; // Reset transition for new text/switch
+                         isFormingText = true;
+                     } else {
+                         // Handle case where new text results in no points (switch to random)
+                         transitionProgress = 0;
+                         isFormingText = false;
+                     }
+                }
+                // If text is the same and already forming, do nothing to progress
+            }
+            // Store current text value for next comparison
+            textInput._previousValue = text;
+        }
+
+
+        // --- Text Target Update (No changes) ---
+        function updateTextTargets(text) {
+            textTargetPoints = [];
+            textCtx.clearRect(0, 0, canvasWidth, canvasHeight);
+            textCtx.font = 'bold 120px Arial';
+            textCtx.fillStyle = 'white';
+            textCtx.textAlign = 'center';
+            textCtx.textBaseline = 'middle';
+            textCtx.fillText(text, canvasWidth / 2, canvasHeight / 2);
+
+            const imageData = textCtx.getImageData(0, 0, canvasWidth, canvasHeight);
+            const data = imageData.data;
+            const samplingStep = 4;
+
+            for (let y = 0; y < canvasHeight; y += samplingStep) {
+                for (let x = 0; x < canvasWidth; x += samplingStep) {
+                    const index = (y * canvasWidth + x) * 4;
+                    if (data[index + 3] > 128) {
+                        const worldX = (x - canvasWidth / 2) * 2.5;
+                        const worldY = -(y - canvasHeight / 2) * 2.5;
+                        const worldZ = (Math.random() - 0.5) * 50;
+                        textTargetPoints.push(new THREE.Vector3(worldX, worldY, worldZ));
+                    }
+                }
+            }
+            shuffleArray(textTargetPoints);
+            console.log("Sampled points:", textTargetPoints.length);
+        }
+
+        // --- Shuffle Array (No changes) ---
+        function shuffleArray(array) {
+            for (let i = array.length - 1; i > 0; i--) {
+                const j = Math.floor(Math.random() * (i + 1));
+                [array[i], array[j]] = [array[j], array[i]];
+            }
+        }
+
+        // --- Easing Function (No changes) ---
+        function easeInOutCubic(t) {
+            return t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2;
+        }
+
+        // --- Animate Function ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            const delta = clock.getDelta();
+            const elapsedTime = clock.getElapsedTime();
+            const positionsAttribute = particles.geometry.attributes.position;
+            const alphasAttribute = particles.geometry.attributes.particleAlpha;
+
+            // Update shader time uniform
+            material.uniforms.u_time.value = elapsedTime;
+
+            // Update transition progress
+            if (transitionProgress < 1.0) {
+                transitionProgress += delta / transitionDuration;
+                transitionProgress = Math.min(transitionProgress, 1.0);
+            }
+            const easedProgress = easeInOutCubic(transitionProgress);
+
+            // Mouse world position calculation
+            const vector = new THREE.Vector3(mouse.x, mouse.y, 0.5);
+            vector.unproject(camera);
+            const dir = vector.sub(camera.position).normalize();
+            const distance = -camera.position.z / dir.z;
+            const mouseWorldPos = camera.position.clone().add(dir.multiplyScalar(distance));
+
+            // Update particles
+            for (let i = 0; i < particleCount; i++) {
+                const i3 = i * 3;
+                const ox = originalPositions[i3];
+                const oy = originalPositions[i3 + 1];
+                const oz = originalPositions[i3 + 2];
+
+                // Mouse repulsion (only in random state)
+                let repelX = 0, repelY = 0, repelZ = 0;
+                if (!isFormingText) {
+                    const dx = ox - mouseWorldPos.x; const dy = oy - mouseWorldPos.y; const dz = oz - mouseWorldPos.z;
+                    const distSq = dx * dx + dy * dy + dz * dz;
+                    const maxDistSq = interactionRadius * interactionRadius * 2;
+                    if (distSq < maxDistSq) {
+                        const force = (1.0 - distSq / maxDistSq) * 30;
+                        const invDist = force / Math.sqrt(distSq + 0.001);
+                        repelX = dx * invDist; repelY = dy * invDist; repelZ = dz * invDist;
+                    }
+                }
+                const nonTextX = ox + repelX; const nonTextY = oy + repelY; const nonTextZ = oz + repelZ;
+
+                // Determine target position and alpha
+                let actualTargetX, actualTargetY, actualTargetZ;
+                let targetAlpha;
+                if (isFormingText) {
+                    if (i < textTargetPoints.length) {
+                        const targetIndex = i % textTargetPoints.length;
+                        actualTargetX = textTargetPoints[targetIndex].x; actualTargetY = textTargetPoints[targetIndex].y; actualTargetZ = textTargetPoints[targetIndex].z;
+                        targetAlpha = 1.0;
+                    } else {
+                        actualTargetX = ox; actualTargetY = oy; actualTargetZ = oz;
+                        targetAlpha = 0.0;
+                    }
+                } else {
+                    actualTargetX = nonTextX; actualTargetY = nonTextY; actualTargetZ = nonTextZ;
+                    targetAlpha = 1.0;
+                }
+
+                // Interpolate position
+                const currentX = positionsAttribute.array[i3]; const currentY = positionsAttribute.array[i3 + 1]; const currentZ = positionsAttribute.array[i3 + 2];
+                let finalX = currentX + (actualTargetX - currentX) * easedProgress;
+                let finalY = currentY + (actualTargetY - currentY) * easedProgress;
+                let finalZ = currentZ + (actualTargetZ - currentZ) * easedProgress;
+
+                // Interpolate alpha
+                const currentAlpha = alphasAttribute.array[i];
+                let finalAlpha = currentAlpha + (targetAlpha - currentAlpha) * easedProgress;
+                alphasAttribute.array[i] = finalAlpha;
+
+                // Subtle movement (Apply if forming text and particle is part of text)
+                // Slightly increased intensity
+                if (isFormingText && i < textTargetPoints.length) {
+                    const movementIntensity = 0.5; // Increased intensity slightly
+                    const movementSpeed = 0.6;
+                    const variation = i * 0.05 + ox * 0.01;
+                    finalX += Math.sin(elapsedTime * movementSpeed + variation) * movementIntensity;
+                    finalY += Math.cos(elapsedTime * movementSpeed * 0.8 + variation * 1.1) * movementIntensity;
+                    finalZ += Math.sin(elapsedTime * movementSpeed * 0.7 + variation * 1.2) * movementIntensity;
+                }
+
+                // Update position buffer
+                positionsAttribute.array[i3] = finalX; positionsAttribute.array[i3 + 1] = finalY; positionsAttribute.array[i3 + 2] = finalZ;
+            }
+
+            // Update attributes
+            positionsAttribute.needsUpdate = true;
+            alphasAttribute.needsUpdate = true;
+
+            renderer.render(scene, camera);
+        }
+
+        init();
+        animate();
+
+    </script>
+</body>
+</html>
